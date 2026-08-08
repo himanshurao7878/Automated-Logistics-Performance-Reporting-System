@@ -1,4 +1,0 @@
-client_secret.json
-seller_data/
-__pycache__/
-*.pyc
