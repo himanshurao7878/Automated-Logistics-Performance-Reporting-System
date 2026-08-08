@@ -7,16 +7,17 @@ import zipfile
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-EMAIL = "himanshu.yadav@shipway.com"
-PASSWORD = "gaqnjyfzzfktzisz"
+
+EMAIL = "your_email@gmail.com"
+PASSWORD = "your_16_char_app_password"
 
 # ------------------------------------------
 # CONFIG
 # ------------------------------------------
 SERVICE_ACCOUNT_FILE = "client_secret.json"
-REQUESTS_SHEET_KEY = "16mDNE7UgKKpsmEGwS0oD5SjeKll9g1ZRlsZsnhEMsZU"
+REQUESTS_SHEET_KEY = "1k0jxOUm24aA_35qLwL4f6dYNRNsPCJ0mOvL9BMep3so"
 REQUESTS_TAB = "Form responses 1"
-OUTPUT_SHEET_KEY = "1xGqShurVl6YCCDKzeb3DRGTsSIGSaPr2ns_0mNHgm54"
+OUTPUT_SHEET_KEY = "1RlzF5s5HjvA-64KjVUuNqdkxfq7NouRsByaJuLaFYNw"
 # ------------------------------------------
 # CONNECT
 # ------------------------------------------
