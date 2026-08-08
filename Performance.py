@@ -1,197 +1,73 @@
 import pandas as pd
 import os
-import re
-import zipfile
-import smtplib
-import requests
 import pygsheets
-import openpyxl
-from email.message import EmailMessage
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-import google_auth_httplib2
-import httplib2
-from openpyxl.styles import PatternFill, Font, Border, Side
+import sys
 
-# ==========================================================
+company_id = sys.argv[1] if len(sys.argv) > 1 else "90001"
+# ------------------------------------------
 # CONFIG
-# ==========================================================
-os.chdir(r'D:\Kam_Seller_Perfomance')
+# ------------------------------------------
+os.chdir(r'C:\Seller_performance')
 
-SERVICE_ACCOUNT_FILE = "client_secret.json"
-REQUESTS_SHEET_KEY = "16mDNE7UgKKpsmEGwS0oD5SjeKll9g1ZRlsZsnhEMsZU"
-REQUESTS_TAB = "Form responses 1"
-OUTPUT_SHEET_KEY = "1nnBDO2c3biiY26vzyxuFF60mW5DwVzy80eSGCS7KK5w"
+raw_data_file = r'C:\Seller_performance\raw_csv\shipway_orders_last3months.csv'
+# ------------------------------------------
+# FAST CSV LOAD
+# ------------------------------------------
+Merge = pd.read_csv(raw_data_file, encoding='latin1', on_bad_lines='skip', low_memory=False)
 
-EMAIL = "" ## add your eamil
-EMAIL_PASSWORD = ""  ## add your app password
+# ------------------------------------------
+# CLEAN COLUMN NAMES (FIX BOM ISSUE)
+# ------------------------------------------
+Merge.columns = (
+    Merge.columns
+    .str.replace('ï»¿', '', regex=False)
+    .str.replace('"', '', regex=False)
+    .str.strip()
+)
 
-# Gmail rejects messages whose total size (attachments included, and
-# base64 encoding inflates size by ~37%) exceeds 25MB. 20MB raw is a
-# safe margin under that. Past this, files are uploaded to Drive and the
-# email links to them instead of attaching directly.
-GMAIL_SAFE_ATTACHMENT_MB = 20
+print("Rows Loaded:", Merge.shape[0])
+print("Columns:", Merge.columns.tolist())
 
-# TODO: fill in a folder ID inside a Shared Drive. Service accounts have
-# no personal Drive storage quota of their own — uploading to "My Drive"
-# under the service account will fail with a storage-quota error. This
-# needs to be a folder the service account has write access to inside a
-# Shared Drive (the same fix already used for the Metabase CSV export
-# pipeline's quota issue).
-DRIVE_UPLOAD_FOLDER_ID = ""  ##Drive Folder ID
+# ------------------------------------------
+# COMPANY ID FILTER
+# ------------------------------------------
+allowed_ids = [company_id]
 
-# Every report email gets CC'd to these addresses in addition to the
-# requester.
-CC_EMAILS = [
-    "reports@shipway.com",
-]
+Merge['Company ID'] = Merge['Company ID'].astype(str)
+Merge = Merge[Merge['Company ID'].isin(allowed_ids)]
 
-METABASE_URL = ""
-USERNAME = ""
-PASSWORD = ""
-QUESTION_ID = 2982
+print("Rows After Company Filter:", Merge.shape[0])
 
-# SSL verification for the Metabase connection.
-#   True                -> verify normally (default, keep this if possible)
-#   "/path/to/ca.pem"    -> verify against a specific internal CA bundle
-#                           (get this file from IT/DevOps — proper fix for
-#                           an internally-issued cert that isn't in the
-#                           system trust store)
-#   False                -> disable verification entirely. Only acceptable
-#                           because metabase.shipway.com is on your private
-#                           network, not the public internet — this still
-#                           means no protection against a man-in-the-middle
-#                           for anyone already on that network. Treat as a
-#                           temporary workaround, not a permanent setting.
-METABASE_VERIFY_SSL = False
+if Merge.empty:
+    raise ValueError("No rows found after Company ID filter")
 
-if METABASE_VERIFY_SSL is False:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ------------------------------------------
+# SMART DATE PARSER
+# ------------------------------------------
 
-# TODO: confirm these match the variable names configured on the card's
-# Start Date / End Date / Company ID filter widgets (Metabase > edit
-# question > click each filter > "Variable name" field)
-START_DATE_TAG = "start_date"
-END_DATE_TAG = "end_date"
-COMPANY_ID_TAG = "company_id"
+# def smart_parse(col):
 
-VALID_DURATIONS = {
-    "last 3 months",
-    "current month and last 2 months",
-    "current month and last 1 month",
-    "current month",
-    "last month",
-}
+#     if pd.api.types.is_datetime64_any_dtype(col):
+#         return col
 
-# ==========================================================
-# RETRY-ENABLED SESSION
-# (Metabase calls are in the critical path of every run — retry
-#  transient network/5xx/429 failures instead of failing the whole run)
-# ==========================================================
-def _build_session():
-    session = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1,       # 1s, 2s, 4s between retries
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
-    )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    session.mount("http://", HTTPAdapter(max_retries=retries))
-    return session
+#     sample = col.dropna().astype(str).head(5)
 
-_session = _build_session()
+#     if not sample.empty and sample.str.match(r"\d{4}-\d{2}-\d{2}").all():
+#         return pd.to_datetime(col, errors="coerce")
 
-
-def get_metabase_session_token():
-    resp = _session.post(
-        f"{METABASE_URL}/api/session",
-        json={"username": USERNAME, "password": PASSWORD},
-        timeout=30,
-        verify=METABASE_VERIFY_SSL,
-    )
-    resp.raise_for_status()
-    return resp.json()["id"]
-
-
-def fetch_card_json(question_id, company_id, start_date, end_date):
-    """Runs the Metabase question with Start Date / End Date / Company ID
-    parameters via the /query/json endpoint, matching the working reference
-    pattern: parameters sent as a JSON body (json=payload), not as a
-    form-encoded field against the /query/csv export endpoint.
-    Filtering happens in the warehouse instead of downloading everything
-    and filtering client-side."""
-    url = f"{METABASE_URL}/api/card/{question_id}/query/json"
-
-    payload = {
-        "parameters": [
-            {"type": "date/single", "target": ["variable", ["template-tag", START_DATE_TAG]], "value": start_date},
-            {"type": "date/single", "target": ["variable", ["template-tag", END_DATE_TAG]], "value": end_date},
-            {"type": "category", "target": ["variable", ["template-tag", COMPANY_ID_TAG]], "value": str(company_id)},
-        ]
-    }
-
-    headers = {"X-Metabase-Session": get_metabase_session_token()}
-
-    resp = _session.post(
-        url,
-        json=payload,
-        headers=headers,
-        verify=METABASE_VERIFY_SSL,
-        timeout=300,
-    )
-    resp.raise_for_status()
-    return pd.DataFrame(resp.json())
-
-
-def compute_date_range(duration_option, today_dt=None):
-    """Maps the form's Duration choice to a concrete date range."""
-    today_dt = today_dt or datetime.today()
-    duration_normalized = duration_option.strip().lower()
-
-    if duration_normalized == "current month":
-        range_start = today_dt.replace(day=1)
-        range_end = today_dt
-    elif duration_normalized == "last month":
-        range_start = today_dt.replace(day=1) - relativedelta(months=1)
-        range_end = today_dt.replace(day=1) - relativedelta(days=1)
-    elif duration_normalized == "current month and last 1 month":
-        range_start = today_dt.replace(day=1) - relativedelta(months=1)
-        range_end = today_dt
-    elif duration_normalized == "current month and last 2 months":
-        range_start = today_dt.replace(day=1) - relativedelta(months=2)
-        range_end = today_dt
-    elif duration_normalized == "last 3 months":
-        range_start = today_dt.replace(day=1) - relativedelta(months=3)
-        range_end = today_dt.replace(day=1) - relativedelta(days=1)
-    else:
-        raise ValueError(
-            f"Unrecognized Duration option: {duration_option!r}. "
-            f"Expected one of: 'Last 3 Months', 'Current Month and Last 2 Months', "
-            f"'Current Month and Last 1 Month', 'Current Month', 'Last Month'."
-        )
-
-    return range_start, range_end
-
+#     return pd.to_datetime(col, errors="coerce", dayfirst=True)
 
 def smart_parse(col):
-    """DB export dates are already clean 'YYYY-MM-DD HH:MM:SS' / 'YYYY-MM-DD',
-    so this mainly guards against stray formats slipping through."""
     if pd.api.types.is_datetime64_any_dtype(col):
         return col
 
     col = col.astype(str).str.replace("T", " ").str.strip()
 
-    parsed = pd.to_datetime(col, format="%Y-%m-%d %H:%M:%S", errors="coerce")
-    parsed = parsed.fillna(pd.to_datetime(col, format="%Y-%m-%d", errors="coerce"))
-    parsed = parsed.fillna(pd.to_datetime(col, format="%d-%m-%Y %H:%M:%S", errors="coerce"))
+    parsed = pd.to_datetime(col, format="%d-%m-%Y %H:%M:%S", errors="coerce")
+    parsed = parsed.fillna(pd.to_datetime(col, format="%Y-%m-%d %H:%M:%S", errors="coerce"))
     parsed = parsed.fillna(pd.to_datetime(col, format="%d-%m-%Y %H:%M", errors="coerce"))
+    parsed = parsed.fillna(pd.to_datetime(col, format="%Y-%m-%d %H:%M", errors="coerce"))
 
     numeric_mask = pd.to_numeric(col, errors='coerce').notna()
     if numeric_mask.any():
@@ -205,132 +81,92 @@ def smart_parse(col):
     return parsed
 
 
-def attempt_category(row):
-    ac = pd.to_numeric(row["Total Attempt Counts"], errors="coerce")
-    if pd.isna(row["First Attempt Date_ts"]) or pd.isna(ac) or ac == 0:
-        return "Not_Attempt"
-    elif ac == 1:
-        return "FASR"
-    else:
-        return "NDR"
-
-
-def o2p_cat(x):
-    if pd.isna(x):
-        return ""
-    if x <= 1:
-        return "Within 24 hours"
-    if x <= 2:
-        return "Within 48 hours"
-    return "More than 48 hours"
-
-
-# The DB export's `status` field mixes two taxonomies:
-#   1) human-readable statuses with underscores (e.g. RTO_DELIVERED, PICKUP_EXCEPTION)
-#   2) raw internal shipment-status codes (SHPFR#, SHNDR#, RTONDR#, DEL, FDR, INT, SCH, UND, ...)
-# Code families are grouped by prefix, cross-checked against Shipment_Status_Raw:
-#   SHPFR*  -> NOT PICKED   (verified: SHPFR rows map to 'pickup_pending')
-#   SHNDR*  -> UNDELIVERED  (forward NDR attempt series)
-#   RTONDR* -> RTO          (RTO NDR attempt series)
-#   DEL -> DELIVERED | INT -> IN TRANSIT | SCH -> NOT PICKED | UND -> UNDELIVERED
-#   FDR -> UNDELIVERED (low sample count) | MISROUTED -> IN TRANSIT | RTO_LOCKED -> RTO
-#   CANCELED -> NOT PICKED
-STATUS_GROUP_MAP = {
-    "DELIVERED": "DELIVERED",
-    "RTO_DELIVERED": "RTO",
-    "PICKUP_EXCEPTION": "NOT PICKED",
-    "LOST": "LOST & DAMAGED",
-    "RTO_IN_TRANSIT": "RTO",
-    "UNDELIVERED": "UNDELIVERED",
-    "RTO_NDR": "RTO",
-    "RTO_OFD": "RTO",
-    "IN_TRANSIT": "IN TRANSIT",
-    "OUT_FOR_DELIVERY": "OUT FOR DELIVERY",
-    "REACHED_AT_DESTINATION_HUB": "IN TRANSIT",
-    "AWB_ASSIGNED": "NOT PICKED",
-    "OUT_FOR_PICKUP": "NOT PICKED",
-    "DELAYED": "UNDELIVERED",
-    "PICKED_UP": "IN TRANSIT",
-    "DAMAGED": "LOST & DAMAGED",
-    "RTO_INITIATED": "RTO",
-    "SHIPPED": "IN TRANSIT",
-    "PICKUP_GENERATED": "NOT PICKED",
-    "RTO": "RTO",
-    "RTO_LOCKED": "RTO",
-    "CANCELED": "NOT PICKED",
-    "MISROUTED": "IN TRANSIT",
-    "DEL": "DELIVERED",
-    "INT": "IN TRANSIT",
-    "SCH": "NOT PICKED",
-    "UND": "UNDELIVERED",
-    "FDR": "UNDELIVERED",
-}
-
-
-def map_status_group(status):
-    s = str(status).strip()
-    if s in STATUS_GROUP_MAP:
-        return STATUS_GROUP_MAP[s]
-    if s.startswith("SHPFR"):
-        return "NOT PICKED"
-    if s.startswith("SHNDR"):
-        return "UNDELIVERED"
-    if s.startswith("RTONDR"):
-        return "RTO"
-    return "Others"
-
-
-RENAME_MAP = {
-    'company_id': 'Company ID',
-    'company_name': 'Company Name',
-    'carrier_id': 'Courier ID',
-    'courier_group': 'Parent Courier',
-    'courier_child': 'Courier Slab',
-    'tracking_number': 'Tracking Number',
-    'status': 'Status',
-    'sub_status': 'Sub Status',
-    'rad_date': 'RAD Status Date',
-    'Total_Order_Amount': 'Total Order Amount',
-    'Payment_Mode': 'Payment Method',
-    'shipping_pincode': 'Shipping Pincode',
-    'pickup_pincode': 'Pickup Pincode',
-    'shipping_state': 'Shipping State',          # newly added: query now returns this column
-    'Zone_Name': 'Zone',
-    'pickup_date': 'Pickup Date',
-    'order_time': 'Order Assign Date',
-    'First_Attempt_date': 'First Attempt Date',
-    'last_ndr_attempt_reason': 'NDR Last NDR Status',
-    'last_ndr_attempt_date': 'NDR Last Attempt Date',
-    'total_ndr_attempt_count': 'NDR Attempt Count',
-    'delivery_date': 'Delivery Date',
-    'rto_date': 'RTO Initiated Date',
-    'rtd_date': 'RTD Date',
-    'total_attempt_count': 'Total Attempt Counts',
-    'shipping_city': 'Shipping City',
-    'second_ndr_attempt_date': 'NDR Second Attempt Date',
-    'third_ndr_attempt_date': 'NDR Third Attempt Date',
-    'pickup_city': 'Pickup City',
-    'order_id': 'Order ID',
-    'vendor_order_id': 'Vendor Order ID',
-    'shipment_status': 'Shipment_Status_Raw',  # kept as QA cross-check column
-    'product_name': 'Product Name',
-    'product_quantity': 'Product Quantity',
-}
-
-DATE_COLS = [
+# ------------------------------------------
+# DATE PARSING
+# ------------------------------------------
+date_cols = [
     "Order Assign Date",
     "Pickup Date",
     "First Attempt Date",
     "Delivery Date",
+    "AWB Shipped Date",
     "EDD Date",
     "NDR Last Attempt Date",
     "NDR Second Attempt Date",
     "NDR Third Attempt Date",
     "RTO Initiated Date",
-    "RTD Date",
+    "RTD Date"
 ]
 
-TAT_MAP = {
+for col in date_cols:
+    if col in Merge.columns:
+        Merge[col + "_ts"] = smart_parse(Merge[col])
+
+# ------------------------------------------
+# DATE ONLY
+# ------------------------------------------
+Merge["Assign_Date"] = Merge["Order Assign Date_ts"].dt.date
+Merge["Attempt_Date"] = Merge["First Attempt Date_ts"].dt.date
+
+# ------------------------------------------
+# SPEED
+# ------------------------------------------
+Merge["speed"] = (
+    Merge["Courier Slab"]
+    .astype(str)
+    .str.contains("express", case=False)
+    .map({True: "Air", False: "Surface"})
+)
+
+# ------------------------------------------
+# MONTH / WEEK
+# ------------------------------------------
+Merge["Assign_Timestamp"] = Merge["Order Assign Date_ts"]
+
+Merge["Month"] = Merge["Assign_Timestamp"].dt.strftime('%b-%y')
+Merge["Day"] = Merge["Assign_Timestamp"].dt.day
+
+Merge["Week"] = pd.cut(
+    Merge["Day"],
+    bins=[0, 7, 14, 21, 31],
+    labels=[1, 2, 3, 4],
+    right=True
+).astype("Int64")
+
+Merge["Week_Month"] = "Week" + Merge["Week"].astype(str) + "-" + Merge["Month"]
+
+# ------------------------------------------
+# TRANSIT TIMES
+# ------------------------------------------
+Merge['O2P'] = (Merge['Pickup Date_ts'] - Merge['Order Assign Date_ts']).dt.days
+Merge['O2D'] = (Merge['Delivery Date_ts'] - Merge['Order Assign Date_ts']).dt.days
+Merge['P2A'] = (Merge['First Attempt Date_ts'] - Merge['Pickup Date_ts']).dt.days
+Merge['P2D'] = (Merge['Delivery Date_ts'] - Merge['Pickup Date_ts']).dt.days
+
+# ------------------------------------------
+# ZONE NORMALIZATION
+# ------------------------------------------
+Merge["Zone_clean"] = (
+    Merge["Zone"]
+    .astype(str)
+    .str.strip()
+    .str.lower()
+)
+
+zone_map = {
+    "metro to metro": "metro to metro",
+    "same city": "same city",
+    "same state": "same state",
+    "north east , j&k": "north east , j&k",
+    "rest of india": "rest of india"
+}
+
+Merge["Zone_clean"] = Merge["Zone_clean"].replace(zone_map)
+
+# ------------------------------------------
+# TAT LOGIC
+# ------------------------------------------
+tat_map = {
     "surface": {
         "rest of india": 7,
         "same city": 2,
@@ -344,725 +180,192 @@ TAT_MAP = {
         "same state": 3,
         "north east , j&k": 7,
         "metro to metro": 3,
-    },
+    }
 }
 
-ZONE_MAP = {
-    "metro to metro": "metro to metro",
-    "same city": "same city",
-    "same state": "same state",
-    "north east , j&k": "north east , j&k",
-    "rest of india": "rest of india",
+Merge["TAT"] = Merge.apply(
+    lambda x: tat_map.get(str(x["speed"]).lower(), {}).get(x["Zone_clean"], pd.NA),
+    axis=1
+)
+
+Merge["TAT"] = pd.to_numeric(Merge["TAT"], errors="coerce")
+
+# ------------------------------------------
+# SLA STATUS
+# ------------------------------------------
+Merge["SLA_Status"] = Merge.apply(
+    lambda x: (
+        ""
+        if pd.isna(x["P2A"]) or pd.isna(x["TAT"])
+        else "Within_TAT" if x["P2A"] <= x["TAT"]
+        else "TAT_Breached"
+    ),
+    axis=1
+)
+
+# ------------------------------------------
+# ATTEMPT CATEGORY
+# ------------------------------------------
+def attempt_category(row):
+
+    ac = pd.to_numeric(row["Total Attempt Counts"], errors="coerce")
+
+    if pd.isna(row["First Attempt Date_ts"]) or pd.isna(ac) or ac == 0:
+        return "Not_Attempt"
+    elif ac == 1:
+        return "FASR"
+    else:
+        return "NDR"
+
+Merge["Attempt_Category"] = Merge.apply(attempt_category, axis=1)
+
+# ------------------------------------------
+# DELIVERED CATEGORY
+# ------------------------------------------
+Merge["Delivered_Category"] = Merge.apply(
+    lambda x: (
+        "FASR_Delivered"
+        if x["Status"] == "DELIVERED"
+        and pd.to_numeric(x["NDR Attempt Count"], errors="coerce") == 0
+        else "NDR_Delivered"
+        if x["Status"] == "DELIVERED"
+        and pd.to_numeric(x["NDR Attempt Count"], errors="coerce") > 0
+        else ""
+    ),
+    axis=1
+)
+
+# ------------------------------------------
+# O2P COMPLIANCE
+# ------------------------------------------
+def o2p_cat(x):
+
+    if pd.isna(x):
+        return ""
+
+    if x <= 1:
+        return "Within 24 hours"
+
+    if x <= 2:
+        return "Within 48 hours"
+
+    return "More than 48 hours"
+
+Merge["O2P_Compliance"] = Merge["O2P"].apply(o2p_cat)
+
+# ------------------------------------------
+# STATUS GROUP
+# ------------------------------------------
+status_group_map = {
+    "DELIVERED": "DELIVERED",
+    "RTO DELIVERED": "RTO",
+    "PICKUP EXCEPTION": "NOT PICKED",
+    "LOST": "LOST & DAMAGED",
+    "RTO IN TRANSIT": "RTO",
+    "Shipment Booked": "NOT PICKED",
+    "UNDELIVERED": "UNDELIVERED",
+    "RTO NDR": "RTO",
+    "RTO OFD": "RTO",
+    "IN TRANSIT": "IN TRANSIT",
+    "OUT FOR DELIVERY": "OUT FOR DELIVERY",
+    "REACHED AT DESTINATION HUB": "IN TRANSIT",
+    "AWB ASSIGNED": "NOT PICKED",
+    "OUT FOR PICKUP": "NOT PICKED",
+    "DELAYED": "UNDELIVERED",
+    "PICKED UP": "IN TRANSIT",
+    "DAMAGED": "LOST & DAMAGED",
+    "RTO INITIATED" : "RTO",
+    "SHIPPED" : "IN TRANSIT",
+    "PICKUP GENERATED" : "NOT PICKED"
 }
 
-# COLUMN LIST = EXACT SAME NAMES/ORDER AS THE ORIGINAL PANEL SCRIPT, so the
-# Google Sheet's column positions never shift between runs. Columns the DB
-# export doesn't have (AWB Shipped Date, Follow-up Mode, Last Customer
-# response, NDR/RTO Scan Reason) are still emitted as columns, just filled
-# blank. 'Shipping State' is now populated from the query (via RENAME_MAP)
-# rather than always blank. New columns the DB export adds are appended
-# at the end so they don't disturb the layout.
-REQUIRED_COLS = [
-    'Company ID', 'Company Name', 'Courier ID', 'Parent Courier', 'Courier Slab',
-    'Tracking Number', 'Status', 'RAD Status Date', 'Total Order Amount',
-    'Payment Method', 'Shipping Pincode', 'Pickup Pincode', 'Zone', 'Pickup Date',
-    'Order Assign Date', 'AWB Shipped Date', 'EDD Date', 'First Attempt Date',
-    'NDR Last NDR Status', 'NDR Last Attempt Date', 'NDR/RTO Scan Reason',
-    'NDR Attempt Count', 'Product Name', 'Delivery Date', 'RTO Initiated Date',
-    'RTD Date', 'Follow-up Mode', 'Last Customer response', 'Assign_Date',
-    'Attempt_Date', 'speed', 'Month', 'Week_Month', 'O2P', 'O2D', 'P2A', 'P2D',
-    'Zone_clean', 'TAT', 'SLA_Status', 'O2P_Compliance', 'Attempt_Category',
-    'Delivered_Category', 'Order_Status_Group', 'Shipping State', 'Shipping City',
-    'NDR Second Attempt Date', 'NDR Third Attempt Date', 'Total Attempt Counts',
-    'Sub Status',
+Merge["Order_Status_Group"] = Merge["Status"].map(status_group_map).fillna("Others")
+
+# ------------------------------------------
+# FINAL EXPORT
+# ------------------------------------------
+required_cols = [
+'Company ID',
+'Company Name',
+'Courier ID',
+'Parent Courier',
+'Courier Slab',
+'Tracking Number',
+'Status',
+'RAD Status Date',
+'Total Order Amount',
+'Payment Method',
+'Shipping Pincode',
+'Pickup Pincode',
+'Zone',
+'Pickup Date',
+'Order Assign Date',
+'AWB Shipped Date',
+'EDD Date',
+'First Attempt Date',
+'NDR Last NDR Status',
+'NDR Last Attempt Date',
+'NDR/RTO Scan Reason',
+'NDR Attempt Count',
+'Product Name',
+'Delivery Date',
+'RTO Initiated Date',
+'RTD Date',
+'Follow-up Mode',
+'Last Customer response',
+'Assign_Date',
+'Attempt_Date',
+'speed',
+'Month',
+'Week_Month',
+'O2P',
+'O2D',
+'P2A',
+'P2D',
+'Zone_clean',
+'TAT',
+'SLA_Status',
+'O2P_Compliance',
+'Attempt_Category',
+'Delivered_Category',
+'Order_Status_Group',
+'Shipping State',
+'Shipping city',
+'NDR Second Attempt Date',
+'NDR Third Attempt Date',
+'Total Attempt Counts',
+'Sub Status',
+'Shipping City'
 ]
 
-NEW_COLS = ['Order ID', 'Vendor Order ID', 'Pickup City', 'Shipment_Status_Raw', 'Product Quantity']
+Final_Output = Merge[[c for c in required_cols if c in Merge.columns]]
 
-FINAL_COL_ORDER = REQUIRED_COLS + NEW_COLS
+Final_Output = Final_Output.fillna("")
 
+today = datetime.today().strftime("%d-%m-%Y")
 
-# ==========================================================
-# CORE PIPELINE: fetch from Metabase -> transform -> save -> upload
-# ==========================================================
-def generate_report(company_id, duration_option):
-    """Runs the full pipeline for one company and returns the output CSV
-    path. Raises on any failure (empty result, bad Duration, etc.) so the
-    caller can catch and skip that row without crashing the whole batch."""
+output_file = fr'C:\Seller_performance\seller_data\{company_id}_{today}.csv'
 
-    range_start, range_end = compute_date_range(duration_option)
-    start_date_str = range_start.strftime("%Y-%m-%d")
-    end_date_str = range_end.strftime("%Y-%m-%d")
-    print(f"[{company_id}] Duration: {duration_option} -> {start_date_str} to {end_date_str}")
+Final_Output.to_csv(
+    output_file,
+    index=False,
+    date_format="%Y-%m-%d"
+)
 
-    # ---- Fetch from Metabase ----
-    Merge = fetch_card_json(QUESTION_ID, company_id, start_date_str, end_date_str)
+print("Final Output Saved:", output_file)
 
-    if Merge.empty:
-        # pd.DataFrame([]) has zero columns and an int64 RangeIndex for
-        # .columns, so anything touching .columns.str.* right after this
-        # (BOM cleanup, renames, etc.) fails with a confusing
-        # "Can only use .str accessor with string values, not integer"
-        # error that has nothing to do with the real cause: Metabase
-        # simply had no matching rows for this company/date range.
-        raise ValueError(
-            f"Metabase returned no rows for Company ID {company_id} "
-            f"in range {start_date_str} to {end_date_str}. "
-            f"Check the Company ID is correct and has shipments in this window."
-        )
+# ------------------------------------------
+# GOOGLE SHEETS UPLOAD
+# ------------------------------------------
 
-    Merge.columns = (
-        Merge.columns
-        .str.replace('ï»¿', '', regex=False)
-        .str.replace('"', '', regex=False)
-        .str.strip()
-    )
-    print(f"[{company_id}] Rows Loaded: {Merge.shape[0]}")
+gc = pygsheets.authorize(service_file="client_secret.json")
 
-    # ---- Company ID filter (safety net; already filtered server-side) ----
-    Merge['company_id'] = Merge['company_id'].astype(str)
-    Merge = Merge[Merge['company_id'].isin([str(company_id)])]
-    print(f"[{company_id}] Rows After Company Filter: {Merge.shape[0]}")
+sh = gc.open_by_key("1RlzF5s5HjvA-64KjVUuNqdkxfq7NouRsByaJuLaFYNw")
 
-    if Merge.empty:
-        raise ValueError(f"No rows found after Company ID filter for {company_id}")
+wks = sh.worksheet_by_title("Raw")
 
-    # ---- EDD: shipway_edd, fallback to courier_edd ----
-    Merge['EDD Date'] = Merge['shipway_edd'].where(
-        Merge['shipway_edd'].notna() & (Merge['shipway_edd'].astype(str).str.strip() != ''),
-        Merge['courier_edd']
-    )
+wks.clear(start="A1")
+wks.resize(rows=len(Final_Output) + 10, cols=len(Final_Output.columns) + 5)
+wks.set_dataframe(Final_Output, "A1", copy_head=True)
 
-    # ---- Rename DB schema -> legacy panel schema ----
-    Merge = Merge.rename(columns=RENAME_MAP)
-
-    # ---- Date parsing ----
-    for col in DATE_COLS:
-        if col in Merge.columns:
-            Merge[col + "_ts"] = smart_parse(Merge[col])
-
-    # ---- Date range safety net ----
-    before_rows = Merge.shape[0]
-    Merge = Merge[
-        (Merge["Order Assign Date_ts"] >= range_start)
-        & (Merge["Order Assign Date_ts"] <= range_end)
-    ]
-    print(f"[{company_id}] Rows After Date Range Safety Filter: {Merge.shape[0]} (was {before_rows})")
-
-    if Merge.empty:
-        raise ValueError(f"No rows found within the applicable date range for Company ID {company_id}")
-
-    # ---- Date-only columns ----
-    Merge["Assign_Date"] = Merge["Order Assign Date_ts"].dt.date
-    Merge["Attempt_Date"] = Merge["First Attempt Date_ts"].dt.date
-
-    # ---- Speed ----
-    Merge["speed"] = (
-        Merge["Courier Slab"]
-        .astype(str)
-        .str.contains("express", case=False)
-        .map({True: "Air", False: "Surface"})
-    )
-
-    # ---- Month / Week ----
-    Merge["Assign_Timestamp"] = Merge["Order Assign Date_ts"]
-    Merge["Month"] = Merge["Assign_Timestamp"].dt.strftime('%b-%y')
-    Merge["Day"] = Merge["Assign_Timestamp"].dt.day
-    Merge["Week"] = pd.cut(
-        Merge["Day"], bins=[0, 7, 14, 21, 31], labels=[1, 2, 3, 4], right=True
-    ).astype("Int64")
-    Merge["Week_Month"] = "Week" + Merge["Week"].astype(str) + "-" + Merge["Month"]
-
-    # ---- Transit times ----
-    Merge['O2P'] = (Merge['Pickup Date_ts'] - Merge['Order Assign Date_ts']).dt.days
-    Merge['O2D'] = (Merge['Delivery Date_ts'] - Merge['Order Assign Date_ts']).dt.days
-    Merge['P2A'] = (Merge['First Attempt Date_ts'] - Merge['Pickup Date_ts']).dt.days
-    Merge['P2D'] = (Merge['Delivery Date_ts'] - Merge['Pickup Date_ts']).dt.days
-
-    # Negative values indicate out-of-order timestamps (e.g. a downstream
-    # status logged before pickup due to data entry lag) rather than a
-    # real negative transit time — clamp to 0 instead of leaving them
-    # negative, which would otherwise skew TAT/SLA and O2P_Compliance
-    # calculations downstream. NaN (missing timestamps) is left as NaN.
-    for col in ['O2P', 'O2D', 'P2A', 'P2D']:
-        Merge[col] = Merge[col].where(Merge[col].isna() | (Merge[col] >= 0), 0)
-
-    # ---- Zone normalization ----
-    Merge["Zone_clean"] = Merge["Zone"].astype(str).str.strip().str.lower()
-    Merge["Zone_clean"] = Merge["Zone_clean"].replace(ZONE_MAP)
-
-    # ---- TAT logic ----
-    Merge["TAT"] = Merge.apply(
-        lambda x: TAT_MAP.get(str(x["speed"]).lower(), {}).get(x["Zone_clean"], pd.NA),
-        axis=1
-    )
-    Merge["TAT"] = pd.to_numeric(Merge["TAT"], errors="coerce")
-
-    # ---- SLA status ----
-    Merge["SLA_Status"] = Merge.apply(
-        lambda x: (
-            "" if pd.isna(x["P2A"]) or pd.isna(x["TAT"])
-            else "Within_TAT" if x["P2A"] <= x["TAT"]
-            else "TAT_Breached"
-        ),
-        axis=1
-    )
-
-    # ---- Attempt category ----
-    Merge["Attempt_Category"] = Merge.apply(attempt_category, axis=1)
-
-    # ---- Delivered category ----
-    Merge["Delivered_Category"] = Merge.apply(
-        lambda x: (
-            "FASR_Delivered"
-            if x["Status"] == "DELIVERED" and pd.to_numeric(x["NDR Attempt Count"], errors="coerce") == 0
-            else "NDR_Delivered"
-            if x["Status"] == "DELIVERED" and pd.to_numeric(x["NDR Attempt Count"], errors="coerce") > 0
-            else ""
-        ),
-        axis=1
-    )
-
-    # ---- O2P compliance ----
-    Merge["O2P_Compliance"] = Merge["O2P"].apply(o2p_cat)
-
-    # ---- Status group + QA cross-check ----
-    Merge["Order_Status_Group"] = Merge["Status"].apply(map_status_group)
-
-    qa_map = {
-        "delivered": "DELIVERED", "RTO": "RTO", "undelivered": "UNDELIVERED",
-        "pickup_pending": "NOT PICKED", "shipped": "IN TRANSIT",
-        "cancelled": "NOT PICKED", "L&D": "LOST & DAMAGED",
-    }
-    if "Shipment_Status_Raw" in Merge.columns:
-        expected = Merge["Shipment_Status_Raw"].map(qa_map)
-        mismatch_mask = expected.notna() & (expected != Merge["Order_Status_Group"])
-        print(f"[{company_id}] QA: {mismatch_mask.sum()} rows where Order_Status_Group disagrees "
-              f"with Shipment_Status_Raw (OUT FOR DELIVERY vs IN TRANSIT splits are expected here)")
-
-    # ---- Final export ----
-    for c in FINAL_COL_ORDER:
-        if c not in Merge.columns:
-            Merge[c] = ""
-
-    Final_Output = Merge[FINAL_COL_ORDER].fillna("")
-
-    # ---- Company name for the filename ----
-    company_name_series = Merge["Company Name"].dropna().astype(str).str.strip()
-    company_name_series = company_name_series[company_name_series != ""]
-    company_name_raw = company_name_series.iloc[0] if not company_name_series.empty else "Unknown"
-    # Strip characters that are invalid in Windows filenames
-    company_name_safe = re.sub(r'[\\/:*?"<>|]', '_', company_name_raw).strip() or "Unknown"
-
-    today_str = datetime.today().strftime("%d-%m-%Y")
-    output_file = fr'D:\Kam_Seller_Perfomance\seller_data\{company_id}_{company_name_safe}_{today_str}.csv'
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-    Final_Output.to_csv(output_file, index=False, date_format="%Y-%m-%d")
-    print(f"[{company_id}] Final Output Saved: {output_file}")
-
-    # ---- Google Sheets upload ----
-    gc = pygsheets.authorize(service_file=SERVICE_ACCOUNT_FILE)
-    sh = gc.open_by_key(OUTPUT_SHEET_KEY)
-
-    # NOTE: every tab in this spreadsheet has live formulas pulling from
-    # 'Raw' (QUERY/ARRAYFORMULA-style), so there is no tab left that's
-    # safe to auto-shrink the way shrink_oversized_tabs() was doing —
-    # shrinking ANY tab's grid can truncate a formula's own spill range
-    # or delete the formula cell itself if it sits past whatever "used
-    # range" gets calculated, causing the exact same permanent #REF!
-    # problem 'Raw' itself had. That function is still defined below for
-    # ad-hoc manual use on a tab you've explicitly confirmed is static
-    # (no live formulas), but it is deliberately NOT called automatically
-    # here anymore.
-    #
-    # 'Raw' itself remains grow-only, never shrunk — growing a range
-    # never breaks a formula reference, only shrinking does.
-    wks = sh.worksheet_by_title("Raw")
-    wks.clear(start="A1")
-
-    target_rows = len(Final_Output) + 10
-    target_cols = len(Final_Output.columns) + 5
-
-    if target_rows > wks.rows or target_cols > wks.cols:
-        new_rows = max(target_rows, wks.rows)
-        new_cols = max(target_cols, wks.cols)
-        try:
-            wks.resize(rows=new_rows, cols=new_cols)
-        except Exception as e:
-            if "10000000 cells" in str(e) or "above the limit" in str(e):
-                raise RuntimeError(
-                    f"Cannot grow the 'Raw' tab to {new_rows} rows x {new_cols} cols — the "
-                    f"spreadsheet is at Google Sheets' 10,000,000-cell limit. Since every tab here "
-                    f"has live formulas reading from 'Raw', none of them can be safely auto-shrunk "
-                    f"to free up headroom (that risks breaking their formulas' spill ranges the same "
-                    f"way shrinking 'Raw' itself used to). This needs a manual decision: either move "
-                    f"some tabs (e.g. Pincode_level, City_level, Product_Summary) to a separate "
-                    f"spreadsheet so they stop sharing this 10M-cell budget with 'Raw', or reduce how "
-                    f"much historical data their formulas pull in."
-                ) from e
-            raise
-    # else: current grid is already large enough for this company's row
-    # count — leave it as-is. Writing fewer rows than the grid holds is
-    # fine; clear() above already blanked out anything left over from
-    # the previous company.
-
-    wks.set_dataframe(Final_Output, "A1", copy_head=True)
-    print(f"[{company_id}] Google Sheet upload completed")
-
-    return output_file
-
-
-# ==========================================================
-# DELIVERY HELPERS: zip, export sheet as xlsx, email
-# ==========================================================
-def shrink_oversized_tabs(sh, exclude_titles=("Raw",), buffer_rows=10, buffer_cols=5, slack_ratio=2.0):
-    """Shrinks every tab in the spreadsheet (except those in
-    `exclude_titles`) down to its actual used range plus a small buffer,
-    if its current grid is holding onto significantly more empty cells
-    than it needs.
-
-    NOT called automatically anymore. In this spreadsheet every tab has
-    live formulas (QUERY/ARRAYFORMULA-style) reading from 'Raw', which
-    means there's no tab left that's safe to blindly auto-shrink —
-    shrinking a tab's grid can truncate a formula's own spill range, or
-    delete the formula cell itself if it sits past whatever "used range"
-    this function calculates, causing a permanent #REF! the same way
-    shrinking 'Raw' itself used to. Resizing back up afterward does NOT
-    undo it.
-
-    Kept here for deliberate, one-off manual use — e.g. from a Python
-    shell — on a SPECIFIC tab you have personally confirmed contains no
-    live formulas and isn't referenced by one elsewhere. Do not wire this
-    back into the automated pipeline without that confirmation for every
-    tab it would touch.
-
-    `slack_ratio` controls how much slack is tolerated before bothering
-    to shrink a tab — avoids resizing (and the API calls that costs) for
-    tabs that are already close to their actual content size.
-    """
-    if isinstance(exclude_titles, str):
-        exclude_titles = (exclude_titles,)
-
-    for wks in sh.worksheets():
-        if wks.title in exclude_titles:
-            continue
-
-        current_rows, current_cols = wks.rows, wks.cols
-        values = wks.get_all_values(include_tailing_empty=False)
-        used_rows = len(values)
-        used_cols = max((len(row) for row in values), default=0)
-
-        target_rows = max(used_rows + buffer_rows, 1)
-        target_cols = max(used_cols + buffer_cols, 1)
-
-        if current_rows * current_cols > target_rows * target_cols * slack_ratio:
-            print(f"Shrinking '{wks.title}' from {current_rows}x{current_cols} "
-                  f"to {target_rows}x{target_cols} to free up cell-limit headroom")
-            wks.resize(rows=target_rows, cols=target_cols)
-
-
-def zip_file(file_path):
-    zip_path = file_path.replace(".csv", ".zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(file_path, arcname=file_path.split("\\")[-1])
-    return zip_path
-
-
-def _google_color_to_hex(color, default=None):
-    """Converts a Sheets API Color object ({red,green,blue} floats 0-1,
-    any channel missing means 0) into an 'RRGGBB' hex string. Returns
-    `default` if no color dict was supplied at all (cell inherits the
-    spreadsheet's baseline, not an explicit color)."""
-    if not color:
-        return default
-    r = round(color.get('red', 0) * 255)
-    g = round(color.get('green', 0) * 255)
-    b = round(color.get('blue', 0) * 255)
-    return f'{r:02X}{g:02X}{b:02X}'
-
-
-# Sheets API border styles -> openpyxl Side styles. Anything not in this
-# map (STYLE_UNSPECIFIED, NONE, or missing) means "no border on this edge".
-GOOGLE_BORDER_STYLE_MAP = {
-    "DOTTED": "dotted",
-    "DASHED": "dashed",
-    "SOLID": "thin",
-    "SOLID_MEDIUM": "medium",
-    "SOLID_THICK": "thick",
-    "DOUBLE": "double",
-}
-
-
-def _google_border_to_side(border):
-    if not border:
-        return None
-    style = GOOGLE_BORDER_STYLE_MAP.get(border.get("style"))
-    if not style:
-        return None
-    color_hex = _google_color_to_hex(border.get("color"), default="000000")
-    return Side(style=style, color=color_hex)
-
-
-def export_sheet_as_xlsx(sheet_key, output_path, large_tab_row_threshold=3000, exclude_titles=("Raw",)):
-    """Exports every tab of the target Google Sheet as an XLSX with the
-    same look (background fills, bold, font colors, borders, merged
-    cells) but no live formulas.
-
-    Four things had to be fixed to get here:
-      1. Drive's native "export as xlsx" keeps every cell's live formula
-         intact — Google-only functions (QUERY/ARRAYFORMULA/IMPORTRANGE)
-         have no Excel equivalent and break with #NAME? the moment Excel
-         tries to recalculate them.
-      2. Rebuilding the workbook from plain get_all_values() fixed the
-         formula problem but threw away all the formatting along with it.
-      3. Reading effectiveFormat brought back fills/fonts, but borders
-         and merged cells are separate pieces of the API response
-         (borders live under effectiveFormat.borders per-cell; merges
-         are a sheet-level `merges` list of GridRanges, not a per-cell
-         property) and need to be applied explicitly.
-      4. Fetching per-cell effectiveFormat (incl. borders) for every cell
-         is fine for a small dashboard tab but becomes enormous for a
-         50k+ row raw-data tab — that single request can take minutes
-         for Sheets to build and return, and something in the network
-         path (proxy/firewall on an idle connection, or the API client's
-         own defaults) will time out waiting on it. A tab holding raw
-         shipment data doesn't have meaningful per-row styling anyway
-         (only the header row is usually styled), so there's nothing
-         lost by treating big tabs as values-only.
-
-    The fix: first check each tab's row count via a cheap metadata-only
-    call. Tabs at or under `large_tab_row_threshold` get the full
-    effectiveFormat + merges treatment (this is where dashboards/summary
-    tabs live, and they're small). Tabs above the threshold get a
-    values-only fetch (formattedValue only, no effectiveFormat/borders)
-    — fast regardless of row count — and the header row is bolded
-    manually, since that's the one piece of styling a raw data dump
-    reliably has and it costs nothing to apply without fetching it.
-
-    `exclude_titles` are skipped entirely — not fetched, not written.
-    'Raw' is excluded by default: it's already delivered in full as the
-    CSV inside the zip attachment, so including it again here is pure
-    duplication, and skipping it means the export never has to fetch
-    its (often huge) row count at all.
-    """
-    if isinstance(exclude_titles, str):
-        exclude_titles = (exclude_titles,)
-
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    )
-    # Generous, explicit timeout for the underlying HTTP client. The
-    # default (effectively no timeout / OS-dependent) is what let a
-    # multi-minute stalled request hang indefinitely instead of failing
-    # fast with a clear error — 300s is enough headroom for even a large
-    # dashboard tab while still failing well before this becomes an
-    # hours-long hang.
-    authed_http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
-    sheets_service = build("sheets", "v4", http=authed_http)
-
-    # Cheap metadata-only call: just titles + row counts, no cell data.
-    meta = sheets_service.spreadsheets().get(
-        spreadsheetId=sheet_key,
-        fields="sheets.properties(title,gridProperties(rowCount,columnCount))"
-    ).execute()
-
-    large_titles, small_titles = [], []
-    for sheet in meta.get("sheets", []):
-        title = sheet["properties"]["title"]
-        if title in exclude_titles:
-            continue
-        row_count = sheet["properties"].get("gridProperties", {}).get("rowCount", 0)
-        (large_titles if row_count > large_tab_row_threshold else small_titles).append(title)
-
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)  # drop the default blank sheet
-
-    # ---- Small tabs: full formatting (fills, fonts, borders, merges) ----
-    if small_titles:
-        resp = sheets_service.spreadsheets().get(
-            spreadsheetId=sheet_key,
-            ranges=small_titles,
-            includeGridData=True,
-            fields="sheets(properties.title,merges,data.rowData.values("
-                   "formattedValue,effectiveFormat(backgroundColor,textFormat(bold,foregroundColor),borders)))"
-        ).execute()
-        for sheet in resp.get("sheets", []):
-            _write_sheet_with_formatting(wb, sheet)
-
-    # ---- Large tabs: values only, header row bolded, no per-cell format fetch ----
-    if large_titles:
-        resp = sheets_service.spreadsheets().get(
-            spreadsheetId=sheet_key,
-            ranges=large_titles,
-            includeGridData=True,
-            fields="sheets(properties.title,data.rowData.values(formattedValue))"
-        ).execute()
-        for sheet in resp.get("sheets", []):
-            _write_sheet_values_only(wb, sheet)
-
-    wb.save(output_path)
-    print(f"Exported live Google Sheet (values + formatting where practical, no formulas) to: {output_path} "
-          f"[full formatting: {small_titles or 'none'}; values-only: {large_titles or 'none'}]")
-
-
-def _write_sheet_with_formatting(wb, sheet):
-    """Writes one tab into the workbook with full fills/fonts/borders/merges."""
-    title = sheet["properties"]["title"]
-    safe_title = re.sub(r'[\\/\?\*\[\]:]', '_', title)[:31] or "Sheet"
-    ws = wb.create_sheet(title=safe_title)
-
-    row_data = sheet.get("data", [{}])[0].get("rowData", [])
-    merges = sheet.get("merges", [])
-
-    # Trim trailing fully-empty rows/columns so tabs sized at Google's
-    # default grid (e.g. 1000x26) don't bloat the file with blank cells.
-    # Merged ranges count too — a merge can span into cells that are
-    # blank themselves (only the anchor cell holds the value), so
-    # without this a merge could get cut off mid-range.
-    max_row, max_col = 0, 0
-    for r_idx, row in enumerate(row_data):
-        for c_idx, cell in enumerate(row.get("values", [])):
-            if cell.get("formattedValue", ""):
-                max_row = max(max_row, r_idx)
-                max_col = max(max_col, c_idx)
-    for merge in merges:
-        max_row = max(max_row, merge.get("endRowIndex", 1) - 1)
-        max_col = max(max_col, merge.get("endColumnIndex", 1) - 1)
-
-    for r_idx, row in enumerate(row_data[:max_row + 1]):
-        for c_idx, cell in enumerate(row.get("values", [])[:max_col + 1]):
-            value = cell.get("formattedValue", "")
-            out_cell = ws.cell(row=r_idx + 1, column=c_idx + 1, value=value)
-
-            fmt = cell.get("effectiveFormat", {})
-
-            bg_hex = _google_color_to_hex(fmt.get("backgroundColor"))
-            if bg_hex and bg_hex != "FFFFFF":
-                out_cell.fill = PatternFill(start_color=bg_hex, end_color=bg_hex, fill_type="solid")
-
-            text_fmt = fmt.get("textFormat", {})
-            bold = text_fmt.get("bold", False)
-            fg_hex = _google_color_to_hex(text_fmt.get("foregroundColor"))
-            font_kwargs = {}
-            if bold:
-                font_kwargs["bold"] = True
-            if fg_hex and fg_hex != "000000":
-                font_kwargs["color"] = fg_hex
-            if font_kwargs:
-                out_cell.font = Font(**font_kwargs)
-
-            borders = fmt.get("borders", {})
-            left = _google_border_to_side(borders.get("left"))
-            right = _google_border_to_side(borders.get("right"))
-            top = _google_border_to_side(borders.get("top"))
-            bottom = _google_border_to_side(borders.get("bottom"))
-            if left or right or top or bottom:
-                out_cell.border = Border(left=left, right=right, top=top, bottom=bottom)
-
-    # Re-apply merged cells. GridRange indices are 0-based with an
-    # exclusive end; openpyxl's merge_cells wants 1-based inclusive
-    # bounds, which numerically is just start+1 / end (no -1 needed
-    # on the end since the conversions cancel out).
-    for merge in merges:
-        start_row = merge.get("startRowIndex", 0) + 1
-        end_row = merge.get("endRowIndex", 1)
-        start_col = merge.get("startColumnIndex", 0) + 1
-        end_col = merge.get("endColumnIndex", 1)
-        if end_row > start_row or end_col > start_col:
-            ws.merge_cells(start_row=start_row, start_column=start_col,
-                            end_row=end_row, end_column=end_col)
-
-
-def _write_sheet_values_only(wb, sheet):
-    """Writes one large tab into the workbook as plain values, bolding
-    just the header row. No per-cell formatting was fetched for these
-    (see export_sheet_as_xlsx docstring for why)."""
-    title = sheet["properties"]["title"]
-    safe_title = re.sub(r'[\\/\?\*\[\]:]', '_', title)[:31] or "Sheet"
-    ws = wb.create_sheet(title=safe_title)
-
-    row_data = sheet.get("data", [{}])[0].get("rowData", [])
-
-    max_row, max_col = 0, 0
-    for r_idx, row in enumerate(row_data):
-        for c_idx, cell in enumerate(row.get("values", [])):
-            if cell.get("formattedValue", ""):
-                max_row = max(max_row, r_idx)
-                max_col = max(max_col, c_idx)
-
-    for r_idx, row in enumerate(row_data[:max_row + 1]):
-        for c_idx, cell in enumerate(row.get("values", [])[:max_col + 1]):
-            value = cell.get("formattedValue", "")
-            out_cell = ws.cell(row=r_idx + 1, column=c_idx + 1, value=value)
-            if r_idx == 0:
-                out_cell.font = Font(bold=True)
-
-
-def upload_to_drive(file_path):
-    """Uploads a file to a Shared Drive folder and returns a viewable
-    link. Used when the report is too large to email as an attachment.
-
-    Must target a Shared Drive folder (DRIVE_UPLOAD_FOLDER_ID) rather
-    than the service account's own "My Drive" — service accounts have no
-    personal storage quota of their own, so an upload there fails with a
-    storage-quota error regardless of file size. supportsAllDrives=True
-    is required on every call for the same reason a Shared Drive is
-    required in the first place.
-    """
-    if not DRIVE_UPLOAD_FOLDER_ID:
-        raise RuntimeError(
-            "DRIVE_UPLOAD_FOLDER_ID is not set — needed to upload oversized "
-            "reports that are too large to email directly. Set it to a "
-            "folder ID inside a Shared Drive the service account can write to."
-        )
-
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/drive.file"]
-    )
-    drive_service = build("drive", "v3", credentials=creds)
-
-    file_metadata = {"name": os.path.basename(file_path), "parents": [DRIVE_UPLOAD_FOLDER_ID]}
-    media = MediaFileUpload(file_path, resumable=True)
-
-    uploaded = drive_service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink",
-        supportsAllDrives=True,
-    ).execute()
-
-    file_id = uploaded["id"]
-
-    # Anyone with the link can view — adjust if this needs to stay
-    # restricted to your Workspace domain instead of the open internet.
-    drive_service.permissions().create(
-        fileId=file_id,
-        body={"role": "reader", "type": "anyone"},
-        supportsAllDrives=True,
-    ).execute()
-
-    link = uploaded.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
-    print(f"Uploaded {os.path.basename(file_path)} to Drive: {link}")
-    return link
-
-
-def send_report_email(to_email, company_id, zip_path, excel_path, cc_emails=None):
-    cc_emails = cc_emails if cc_emails is not None else CC_EMAILS
-
-    total_mb = (os.path.getsize(zip_path) + os.path.getsize(excel_path)) / (1024 * 1024)
-
-    msg = EmailMessage()
-    msg["Subject"] = f"{company_id} - Performance Report"
-    msg["From"] = EMAIL
-    msg["To"] = to_email
-    if cc_emails:
-        msg["Cc"] = ", ".join(cc_emails)
-
-    if total_mb > GMAIL_SAFE_ATTACHMENT_MB:
-        # Too big to attach (Gmail's hard limit is 25MB and base64
-        # encoding adds ~37% overhead on top of the raw file size) —
-        # upload both files to Drive and link them instead.
-        print(f"[{company_id}] Attachments are {total_mb:.1f} MB, over the "
-              f"{GMAIL_SAFE_ATTACHMENT_MB} MB email limit — uploading to Drive instead")
-        zip_link = upload_to_drive(zip_path)
-        excel_link = upload_to_drive(excel_path)
-        msg.set_content(
-            f"Hi Team,\n\nThe Performance Report for Company ID {company_id} is too large "
-            f"to attach directly ({total_mb:.1f} MB), so it's been uploaded to Drive instead:\n\n"
-            f"XLSX summary: {excel_link}\n"
-            f"Raw data (ZIP): {zip_link}\n\n"
-            f"Regards,\nBI Team"
-        )
-    else:
-        msg.set_content(
-            f"Hi Team,\n\nPlease find the attached Performance Report.\n\n"
-            f"✔ XLSX summary\n"
-            f"✔ Raw data attached as ZIP\n\n"
-            f"Regards,\nBI Team"
-        )
-        for file_path in [zip_path, excel_path]:
-            with open(file_path, "rb") as f:
-                file_data = f.read()
-            file_name = file_path.split("\\")[-1]
-            msg.add_attachment(file_data, maintype="application", subtype="octet-stream", filename=file_name)
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=180) as smtp:
-        smtp.login(EMAIL, EMAIL_PASSWORD)
-        smtp.send_message(msg)
-
-    if cc_emails:
-        print(f"Email sent to {to_email} (cc: {', '.join(cc_emails)}) for Company ID {company_id}")
-    else:
-        print(f"Email sent to {to_email} for Company ID {company_id}")
-
-
-# ==========================================================
-# MAIN: poll the request form, process pending rows, deliver
-# ==========================================================
-def main():
-    gc = pygsheets.authorize(service_file=SERVICE_ACCOUNT_FILE)
-    sh = gc.open_by_key(REQUESTS_SHEET_KEY)
-    wks = sh.worksheet_by_title(REQUESTS_TAB)
-
-    records = wks.get_all_records()
-    # each record looks like:
-    # {'Timestamp': '...', 'Email address': '...', 'Company ID': '53276', 'Duration': 'Last 3 Months', 'Status': ''}
-
-    pending_rows = []
-    for i, row in enumerate(records):
-        row_number = i + 2
-        row = {k.strip(): v for k, v in row.items()}  # clean up header whitespace
-        status = str(row.get("Status", "")).strip()
-
-        if status == "":
-            pending_rows.append({
-                "row_number": row_number,
-                "company_id": str(row.get("Company ID", "")).strip(),
-                "email": row.get("Email address", "").strip(),
-                "duration": str(row.get("Duration", "")).strip(),
-            })
-
-    print(f"Total rows found: {len(records)}")
-    print(f"Pending rows found: {len(pending_rows)}")
-
-    for r in pending_rows:
-        company_id = r["company_id"]
-        duration = r["duration"]
-
-        if company_id == "":
-            print(f"Skipping row {r['row_number']} — no Company ID found")
-            continue
-
-        if duration.strip().lower() not in VALID_DURATIONS:
-            print(f"Skipping row {r['row_number']} — unrecognized Duration: {duration!r}")
-            continue
-
-        print(f"\nProcessing row {r['row_number']} — Company ID: {company_id}, Duration: {duration}")
-
-        try:
-            csv_path = generate_report(company_id, duration)
-            print(f"Successfully processed Company ID {company_id}")
-        except Exception as e:
-            print(f"ERROR while processing Company ID {company_id}: {e}")
-            continue
-
-        excel_path = csv_path.replace(".csv", "_Performance.xlsx")
-
-        try:
-            zip_path = zip_file(csv_path)
-            export_sheet_as_xlsx(OUTPUT_SHEET_KEY, excel_path)
-            send_report_email(r["email"], company_id, zip_path, excel_path)
-
-            # Mark this row as Done so it isn't reprocessed next run
-            wks.update_value(f"E{r['row_number']}", "Done")
-            print(f"Marked row {r['row_number']} as Done")
-
-        except Exception as e:
-            print(f"Failed to send email for Company ID {company_id}: {e}")
-
-
-if __name__ == "__main__":
-    main()
+print("Google Sheet upload completed")
