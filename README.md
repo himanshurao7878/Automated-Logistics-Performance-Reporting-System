@@ -1,16 +1,18 @@
 # Automated Logistics Performance Reporting System
 
-An automated Python-based reporting system designed to streamline **Key Account Manager (KAM) operations** by eliminating repetitive manual work involved in generating company-wise logistics performance reports.
+An automated Python-based reporting system designed to streamline **client account performance reporting** by eliminating repetitive manual work involved in generating company-wise logistics performance reports.
 
 The system collects a **Company ID through Google Forms**, automatically processes the corresponding shipment data, calculates logistics performance metrics, updates a live Google Sheet, and emails the completed reports to the requester.
+
+> **Note on data:** `shipway_orders_last3months.csv` in this repository is entirely **synthetic/fake data** (made-up companies, customers, and shipments), generated to demonstrate the pipeline safely without exposing any real business or customer data.
 
 ---
 
 ## 🚀 Project Overview
 
-In a typical manual workflow, KAMs need to:
+In a typical manual workflow, an operations/reporting team needs to:
 
-* Submit a company/reporting request
+* Receive a company/reporting request
 * Find the relevant shipment records
 * Filter data for the required company and time period
 * Calculate performance metrics
@@ -28,7 +30,7 @@ Once Windows Task Scheduler is configured, the system can execute automatically 
 ## 🔄 Workflow
 
 ```text
-KAM
+Requester
  │
  ▼
 Google Form
@@ -69,7 +71,7 @@ Completed Report
 
 ### 1. Automated Request Collection
 
-KAMs submit a **Company ID** through a Google Form.
+Requesters submit a **Company ID** through a Google Form.
 
 The submitted request is stored in a connected Google Sheet with a status such as:
 
@@ -107,7 +109,7 @@ The system calculates important logistics performance metrics such as:
 
 The calculated results are pushed into a Google Sheet that acts as the **live performance report**.
 
-This allows KAMs to access the latest processed performance information without manually preparing reports.
+This allows requesters to access the latest processed performance information without manually preparing reports.
 
 ### 6. Automated Report Delivery
 
@@ -153,10 +155,10 @@ Mark Request Done
 | **Python**                 | Core automation and data processing   |
 | **Pandas**                 | Data cleaning, filtering and analysis |
 | **Google Forms**           | Collecting Company ID requests        |
-| **Google Sheets**          | Request management and live reporting |
+| **Google Sheets API**      | Request management and live reporting |
 | **Excel / XLSX**           | Performance report generation         |
 | **ZIP**                    | Packaging raw shipment data           |
-| **Email Automation**       | Automated report delivery             |
+| **SMTP (Email Automation)**| Automated report delivery             |
 | **Windows Task Scheduler** | Scheduled execution                   |
 
 ---
@@ -169,9 +171,8 @@ The system follows an automated ETL-style workflow:
 
 Data is collected from:
 
-* Google Sheets
-* Raw shipment datasets
-* Request submissions
+* Google Sheets (requests)
+* Raw shipment dataset
 
 ### Transform
 
@@ -201,14 +202,22 @@ Processed results are:
 ```text
 Automated-Logistics-Performance-Reporting-System/
 │
-├── request_controller (1).py
-│   └── Main automation controller
+├── Performance.py
+│   └── Core data processing engine — filters shipment data by Company ID,
+│       calculates performance metrics, and publishes results to Google Sheets
 │
-├── Seller_Performance_Python Script(Himanshu_Yadav).txt
-│   └── Seller/company performance calculation logic
+├── request_controller.py
+│   └── Main automation controller — reads pending requests, triggers
+│       processing, sends report emails, and updates request status
+│
+├── shipway_orders_last3months.csv
+│   └── Synthetic demo dataset (no real company/customer data)
 │
 ├── Shipway internship report formatting.pdf
-│   └── Project/internship documentation
+│   └── Internship documentation
+│
+├── .gitignore
+│   └── Excludes credentials and generated output files
 │
 └── README.md
     └── Project documentation
@@ -282,7 +291,7 @@ This provides a simple mechanism for **idempotent request processing** and helps
 
 ## 🎯 Business Impact
 
-The primary goal of this project is to reduce repetitive manual reporting work for KAM operations.
+The primary goal of this project is to reduce repetitive manual reporting work for account/operations teams.
 
 ### Before Automation
 
@@ -322,7 +331,7 @@ The automation improves:
 * 🔄 Process reliability
 * 📧 Report delivery
 * 📁 Data organization
-* 👨‍💼 KAM productivity
+* 👨‍💼 Team productivity
 
 Most importantly, it removes repetitive manual steps from the reporting workflow.
 
@@ -366,9 +375,9 @@ Potential improvements include:
 * Data Processing
 * Exploratory Data Analysis
 * Business Logic Implementation
-* Google Sheets Integration
+* Google Sheets API Integration
 * Excel Report Automation
-* Email Automation
+* Email Automation (SMTP)
 * Workflow Automation
 * Task Scheduling
 * ETL Concepts
@@ -389,12 +398,6 @@ Potential improvements include:
 > **Tracking:** Pending → Done
 
 > **Execution:** Hourly automation through Task Scheduler
-
----
-
-## 📄 Documentation
-
-Additional project documentation is available in the repository, including the internship/project report.
 
 ---
 
